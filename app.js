@@ -8,7 +8,7 @@ import {
 } from './data.js'
 
 const REAL_APP_URL = 'https://homenex.aiknol.com/'
-const PRODUCT_SITE_URL = '/product' // placeholder — swap for the marketing site
+const PRODUCT_SITE_URL = 'https://homenex-site.pages.dev' // live marketing site
 
 // --- tiny html helper -------------------------------------------------------
 const h = (strings, ...vals) => strings.map((s, i) => s + (vals[i] ?? '')).join('')
