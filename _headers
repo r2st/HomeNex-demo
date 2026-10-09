@@ -2,4 +2,8 @@
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
-  X-Frame-Options: SAMEORIGIN
+
+# Allow widget.js to be embedded on any site
+/widget.js
+  Access-Control-Allow-Origin: *
+  X-Frame-Options: ALLOWALL

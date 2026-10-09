@@ -1,683 +1,917 @@
 // ===========================================================================
-// HomeNex Interactive Demo — tour engine + screen rendering
-// Standalone, no backend. All data from data.js.
+// HomeNex — Viral Property Search Tool for Indian Buyers
+// No login, no backend. Pure client-side. WhatsApp sharing everywhere.
 // ===========================================================================
 import {
-  AGENT, STATS, WORKLIST, ACTIVITY, LEADS, PIPELINE_STAGES,
-  CONVERSATION, LEAD_DETAIL, PROPERTIES,
+  CITIES, LOCALITIES, PROPERTIES, AREA_GUIDES, STAMP_DUTY_RATES,
+  STATE_FOR_CITY, BANK_RATES, SITE_URL,
 } from './data.js'
 
-const REAL_APP_URL = 'https://homenex.aiknol.com/'
-const PRODUCT_SITE_URL = 'https://homenex-site.pages.dev' // live marketing site
-
-// --- tiny html helper -------------------------------------------------------
+const $ = (s, root = document) => root.querySelector(s)
+const $$ = (s, root = document) => [...root.querySelectorAll(s)]
 const h = (strings, ...vals) => strings.map((s, i) => s + (vals[i] ?? '')).join('')
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
-const el = (id) => document.getElementById(id)
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
+const fmt = (n) => n >= 10000000 ? `₹${(n / 10000000).toFixed(2)} Cr` : `₹${(n / 100000).toFixed(0)} L`
+const fmtNum = (n) => new Intl.NumberFormat('en-IN').format(Math.round(n))
 
-const tempEmoji = (t) => (t === 'Hot' ? '🔥' : t === 'Warm' ? '☀️' : '❄️')
+let currentScreen = 'home'
+let selectedCity = 'Bengaluru'
+let filters = { bhk: 'Any', priceMax: Infinity, priceMin: 0, status: 'Any' }
+let compareList = JSON.parse(localStorage.getItem('hn_compare') || '[]')
+let favorites = JSON.parse(localStorage.getItem('hn_favs') || '[]')
 
 // ---------------------------------------------------------------------------
-// SCREEN RENDERERS
+// ROUTING — handle shareable URLs via hash
 // ---------------------------------------------------------------------------
+function parseHash() {
+  const hash = location.hash.slice(1)
+  if (!hash) return { screen: 'home' }
+  const [screen, ...rest] = hash.split('/')
+  return { screen, param: rest.join('/') }
+}
 
-function screenDashboard() {
-  const kpis = [
-    { lbl: 'Waiting for reply', v: STATS.waiting, accent: true },
-    { lbl: 'Hot leads', v: STATS.hot, accent: true },
-    { lbl: "Today's follow-ups", v: STATS.followups, accent: false },
-    { lbl: "Today's site visits", v: STATS.visits, accent: false },
-  ]
-  const dateStr = 'Sunday, 13 July'
+function navigate(screen, param) {
+  const hash = param ? `${screen}/${param}` : screen
+  location.hash = hash
+}
+
+window.addEventListener('hashchange', () => {
+  const { screen, param } = parseHash()
+  renderScreen(screen, param)
+})
+
+// ---------------------------------------------------------------------------
+// WHATSAPP SHARE HELPERS
+// ---------------------------------------------------------------------------
+function waShareProperty(p) {
+  const emi = calcEMI(p.price * 0.8, 8.5, 20)
+  const msg = `🏠 Check out this ${p.bhk} in ${p.locality}, ${p.city} for ${p.priceLabel} | EMI from ₹${fmtNum(emi)}/mo
+
+${p.title} — ${p.area} sq.ft
+${p.status === 'ready' ? '✅ Ready to move' : '🏗️ Under construction'}${p.rera ? ' | RERA ✓' : ''}
+
+👉 ${SITE_URL}#property/${p.id}`
+  return `https://wa.me/?text=${encodeURIComponent(msg)}`
+}
+
+function waShareComparison(ids) {
+  const props = ids.map(id => PROPERTIES.find(p => p.id === id)).filter(Boolean)
+  let msg = `🏠 Property Comparison from HomeNex\n\n`
+  props.forEach((p, i) => {
+    msg += `${i + 1}. ${p.title} — ${p.bhk}, ${p.locality}\n   ${p.priceLabel} | ${p.area} sq.ft\n\n`
+  })
+  msg += `Compare all → ${SITE_URL}#compare/${ids.join(',')}`
+  return `https://wa.me/?text=${encodeURIComponent(msg)}`
+}
+
+function waShareEMI(price, rate, years, emi) {
+  const msg = `💰 EMI Calculator Result from HomeNex
+
+Property Value: ₹${fmtNum(price)}
+Loan Amount (80%): ₹${fmtNum(price * 0.8)}
+Interest Rate: ${rate}%
+Tenure: ${years} years
+
+📊 Monthly EMI: ₹${fmtNum(emi)}
+Total Interest: ₹${fmtNum(emi * years * 12 - price * 0.8)}
+Total Payment: ₹${fmtNum(emi * years * 12)}
+
+Try it yourself 👉 ${SITE_URL}#emi`
+  return `https://wa.me/?text=${encodeURIComponent(msg)}`
+}
+
+function waShareStampDuty(state, price, duty, reg) {
+  const msg = `📋 Stamp Duty Calculator — ${state}
+
+Property Value: ₹${fmtNum(price)}
+Stamp Duty: ₹${fmtNum(duty)}
+Registration: ₹${fmtNum(reg)}
+Total Extra Cost: ₹${fmtNum(duty + reg)}
+
+Calculate yours 👉 ${SITE_URL}#stamp-duty`
+  return `https://wa.me/?text=${encodeURIComponent(msg)}`
+}
+
+// ---------------------------------------------------------------------------
+// EMI CALCULATION
+// ---------------------------------------------------------------------------
+function calcEMI(principal, annualRate, years) {
+  const r = annualRate / 12 / 100
+  const n = years * 12
+  if (r === 0) return principal / n
+  return principal * r * Math.pow(1 + r, n) / (Math.pow(1 + r, n) - 1)
+}
+
+// ---------------------------------------------------------------------------
+// FAVORITES & COMPARE (localStorage, no login)
+// ---------------------------------------------------------------------------
+function toggleFav(id) {
+  const idx = favorites.indexOf(id)
+  if (idx >= 0) favorites.splice(idx, 1)
+  else favorites.push(id)
+  try { localStorage.setItem('hn_favs', JSON.stringify(favorites)) } catch {}
+  renderScreen(currentScreen)
+}
+
+function toggleCompare(id) {
+  const idx = compareList.indexOf(id)
+  if (idx >= 0) compareList.splice(idx, 1)
+  else if (compareList.length < 4) compareList.push(id)
+  try { localStorage.setItem('hn_compare', JSON.stringify(compareList)) } catch {}
+  renderScreen(currentScreen)
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: HOME
+// ---------------------------------------------------------------------------
+function screenHome() {
+  const trending = PROPERTIES.filter(p => p.city === selectedCity).slice(0, 4)
   return h`
-  <div class="panel" data-screen="dashboard">
-    <div class="px" style="padding-top:26px">
+  <div class="screen-content" data-screen="home">
+    <header class="hero">
+      <div class="hero-inner">
+        <div class="hero-badge">🏡 HomeNex</div>
+        <h1>Find your dream home<br>in India</h1>
+        <p>Search properties, calculate EMI, check stamp duty — all free, no login needed</p>
+        <div class="hero-search">
+          <div class="search-row">
+            <select id="city-select" class="search-select">
+              ${CITIES.map(c => h`<option value="${esc(c)}" ${c === selectedCity ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+            </select>
+            <button class="btn-search" onclick="window._hn.search()">Search Properties →</button>
+          </div>
+        </div>
+        <div class="hero-stats">
+          <div><span class="n">${PROPERTIES.length}+</span><span class="l">Properties</span></div>
+          <div><span class="n">${CITIES.length}</span><span class="l">Cities</span></div>
+          <div><span class="n">100%</span><span class="l">Free</span></div>
+        </div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2 class="section-title">Free Tools for Home Buyers</h2>
+      <div class="tools-grid">
+        <div class="tool-card" onclick="window._hn.nav('emi')">
+          <span class="tool-icon">🧮</span>
+          <h3>EMI Calculator</h3>
+          <p>Calculate monthly EMI for any property. Compare bank rates.</p>
+        </div>
+        <div class="tool-card" onclick="window._hn.nav('stamp-duty')">
+          <span class="tool-icon">📋</span>
+          <h3>Stamp Duty Calculator</h3>
+          <p>Know exact stamp duty & registration charges for your state.</p>
+        </div>
+        <div class="tool-card" onclick="window._hn.nav('areas')">
+          <span class="tool-icon">📍</span>
+          <h3>Area Guides</h3>
+          <p>Price trends, connectivity, schools & hospitals — area-wise.</p>
+        </div>
+        <div class="tool-card" onclick="window._hn.nav('search')">
+          <span class="tool-icon">🔍</span>
+          <h3>Property Search</h3>
+          <p>Filter by city, BHK, budget, status. Share via WhatsApp.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
       <div class="flex between items-center">
-        <span class="eyebrow">${dateStr}</span>
-        <span class="fs11 b faint" style="text-decoration:underline;text-underline-offset:2px">Sign out</span>
+        <h2 class="section-title" style="margin-bottom:0">Trending in ${esc(selectedCity)}</h2>
+        <button class="link-btn" onclick="window._hn.nav('search')">View all →</button>
       </div>
-      <h1 class="h1 big mt4">Good morning, ${esc(AGENT.name.split(' ')[0])}</h1>
-      <p class="fs13 muted mt6" style="line-height:1.35">
-        <b style="color:var(--brand-deep)">${STATS.newToday}</b> new leads today ·
-        <b style="color:var(--brand-deep)">${STATS.active24h}</b> active conversations
-      </p>
-
-      <div class="mt16" data-tour="wa-chip" style="display:inline-flex">
-        <span class="wa-chip">
-          <span class="live-dot"></span>
-          <svg class="wa-ico" viewBox="0 0 24 24"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
-          WhatsApp connected · ${esc(AGENT.wa_phone)}
-        </span>
+      <div class="property-scroll">
+        ${trending.map(p => propertyCard(p)).join('')}
       </div>
+    </section>
 
-      <div class="onb-done mt14" data-tour="onboarding">
-        <span class="tick">✓</span>
-        <div class="g1">
-          <p class="fs13 b" style="color:var(--ink)">You're all set up</p>
-          <p class="fs12 muted">WhatsApp number connected · 6 properties added · AI replies live</p>
+    <section class="section cta-section">
+      <h2>Share with family on WhatsApp</h2>
+      <p>Found the perfect home? Share any listing, EMI calculation, or comparison with your family — one tap.</p>
+      <div class="wa-badge-big">
+        <svg viewBox="0 0 24 24" class="wa-icon-big"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+        Every feature has a WhatsApp share button
+      </div>
+    </section>
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// PROPERTY CARD (reused everywhere)
+// ---------------------------------------------------------------------------
+function propertyCard(p) {
+  const isFav = favorites.includes(p.id)
+  const isComp = compareList.includes(p.id)
+  const emi = calcEMI(p.price * 0.8, 8.5, 20)
+  return h`
+  <div class="prop-card" data-id="${p.id}">
+    <div class="prop-card-top">
+      <div class="prop-thumb">${p.img}</div>
+      <div class="prop-card-actions">
+        <button class="icon-btn ${isFav ? 'active' : ''}" onclick="event.stopPropagation();window._hn.fav('${p.id}')" title="Save">
+          ${isFav ? '❤️' : '🤍'}
+        </button>
+        <button class="icon-btn ${isComp ? 'active' : ''}" onclick="event.stopPropagation();window._hn.compare('${p.id}')" title="Compare">
+          ⚖️
+        </button>
+      </div>
+    </div>
+    <div class="prop-card-body" onclick="window._hn.nav('property/${p.id}')">
+      <h3 class="prop-card-title">${esc(p.title)}</h3>
+      <p class="prop-card-loc">${esc(p.bhk)} · ${esc(p.locality)}, ${esc(p.city)} · ${p.area} sq.ft</p>
+      <div class="prop-card-bottom">
+        <div>
+          <span class="prop-card-price">${esc(p.priceLabel)}</span>
+          <span class="prop-card-emi">EMI ₹${fmtNum(emi)}/mo</span>
+        </div>
+        <div class="prop-card-tags">
+          ${p.status === 'ready' ? '<span class="tag ready">Ready</span>' : '<span class="tag uc">Under Construction</span>'}
+          ${p.rera ? '<span class="tag rera">RERA</span>' : ''}
+        </div>
+      </div>
+    </div>
+    <div class="prop-card-share">
+      <a href="${waShareProperty(p)}" target="_blank" rel="noopener" class="wa-share-btn" onclick="event.stopPropagation()">
+        <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+        Share on WhatsApp
+      </a>
+    </div>
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: SEARCH / LISTINGS
+// ---------------------------------------------------------------------------
+function screenSearch() {
+  let results = PROPERTIES.filter(p => p.city === selectedCity)
+  if (filters.bhk !== 'Any') results = results.filter(p => p.bhk.startsWith(filters.bhk.replace(' BHK','')))
+  if (filters.priceMax < Infinity) results = results.filter(p => p.price <= filters.priceMax)
+  if (filters.priceMin > 0) results = results.filter(p => p.price >= filters.priceMin)
+  if (filters.status !== 'Any') results = results.filter(p => p.status === filters.status)
+
+  return h`
+  <div class="screen-content" data-screen="search">
+    <div class="search-header">
+      <h1>Properties in ${esc(selectedCity)}</h1>
+      <p>${results.length} properties found</p>
+    </div>
+
+    <div class="filter-bar">
+      <select id="filter-city" class="filter-select" onchange="window._hn.setCity(this.value)">
+        ${CITIES.map(c => h`<option value="${esc(c)}" ${c === selectedCity ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+      </select>
+      <select id="filter-bhk" class="filter-select" onchange="window._hn.setBhk(this.value)">
+        <option value="Any" ${filters.bhk === 'Any' ? 'selected' : ''}>Any BHK</option>
+        <option value="1" ${filters.bhk === '1' ? 'selected' : ''}>1 BHK</option>
+        <option value="2" ${filters.bhk === '2' ? 'selected' : ''}>2 BHK</option>
+        <option value="3" ${filters.bhk === '3' ? 'selected' : ''}>3 BHK</option>
+        <option value="4" ${filters.bhk === '4' ? 'selected' : ''}>4 BHK</option>
+      </select>
+      <select id="filter-price" class="filter-select" onchange="window._hn.setPrice(this.value)">
+        <option value="0-Infinity" ${filters.priceMax === Infinity ? 'selected' : ''}>Any Price</option>
+        <option value="0-5000000">Under ₹50L</option>
+        <option value="5000000-10000000">₹50L – 1Cr</option>
+        <option value="10000000-25000000">₹1Cr – 2.5Cr</option>
+        <option value="25000000-Infinity">Above ₹2.5Cr</option>
+      </select>
+      <select id="filter-status" class="filter-select" onchange="window._hn.setStatus(this.value)">
+        <option value="Any" ${filters.status === 'Any' ? 'selected' : ''}>Any Status</option>
+        <option value="ready" ${filters.status === 'ready' ? 'selected' : ''}>Ready to Move</option>
+        <option value="uc" ${filters.status === 'uc' ? 'selected' : ''}>Under Construction</option>
+      </select>
+    </div>
+
+    <div class="property-grid">
+      ${results.length ? results.map(p => propertyCard(p)).join('') : '<div class="empty-state"><span class="empty-icon">🏠</span><p>No properties match your filters. Try changing the city or budget.</p></div>'}
+    </div>
+
+    ${compareList.length >= 2 ? h`
+    <div class="compare-fab" onclick="window._hn.nav('compare/${compareList.join(',')}')">
+      ⚖️ Compare ${compareList.length} properties
+    </div>` : ''}
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: PROPERTY DETAIL
+// ---------------------------------------------------------------------------
+function screenProperty(id) {
+  const p = PROPERTIES.find(x => x.id === id)
+  if (!p) return '<div class="screen-content"><div class="section"><h1>Property not found</h1></div></div>'
+  const emi = calcEMI(p.price * 0.8, 8.5, 20)
+  const guide = AREA_GUIDES[p.locality]
+  const similar = PROPERTIES.filter(x => x.city === p.city && x.id !== p.id && x.bhk === p.bhk).slice(0, 3)
+
+  return h`
+  <div class="screen-content" data-screen="property">
+    <button class="back-btn" onclick="history.back()">← Back</button>
+
+    <div class="detail-hero">
+      <div class="detail-thumb">${p.img}</div>
+      <div class="detail-actions">
+        <button class="icon-btn-lg ${favorites.includes(p.id) ? 'active' : ''}" onclick="window._hn.fav('${p.id}')">
+          ${favorites.includes(p.id) ? '❤️ Saved' : '🤍 Save'}
+        </button>
+        <a href="${waShareProperty(p)}" target="_blank" rel="noopener" class="wa-share-btn-lg">
+          <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+          Share on WhatsApp
+        </a>
+      </div>
+    </div>
+
+    <div class="detail-body">
+      <h1>${esc(p.title)}</h1>
+      <p class="detail-sub">${esc(p.bhk)} · ${esc(p.type)} · ${esc(p.locality)}, ${esc(p.city)}</p>
+
+      <div class="detail-price-row">
+        <div>
+          <span class="detail-price">${esc(p.priceLabel)}</span>
+          <span class="detail-emi">EMI from ₹${fmtNum(emi)}/mo</span>
+        </div>
+        <div class="detail-tags">
+          ${p.status === 'ready' ? '<span class="tag ready">✅ Ready to Move</span>' : '<span class="tag uc">🏗️ Under Construction</span>'}
+          ${p.rera ? `<span class="tag rera">RERA ✓</span>` : ''}
         </div>
       </div>
 
-      <div class="kpis mt20" data-tour="kpis">
-        ${kpis.map((k) => h`
-          <div class="kpi ${k.accent ? 'accent' : ''}">
-            <p class="num">${k.v}</p>
-            <p class="lbl">${k.lbl}</p>
+      <div class="detail-grid">
+        <div class="detail-item"><span class="detail-label">Area</span><span class="detail-value">${p.area} sq.ft</span></div>
+        <div class="detail-item"><span class="detail-label">Builder</span><span class="detail-value">${esc(p.builder)}</span></div>
+        <div class="detail-item"><span class="detail-label">Floor</span><span class="detail-value">${esc(p.floors)}</span></div>
+        <div class="detail-item"><span class="detail-label">Facing</span><span class="detail-value">${esc(p.facing)}</span></div>
+        <div class="detail-item"><span class="detail-label">Parking</span><span class="detail-value">${p.parking} covered</span></div>
+        <div class="detail-item"><span class="detail-label">Year</span><span class="detail-value">${p.yearBuilt}</span></div>
+        ${p.rera ? h`<div class="detail-item full"><span class="detail-label">RERA No.</span><span class="detail-value" style="font-size:11px">${esc(p.rera)}</span></div>` : ''}
+      </div>
+
+      <div class="detail-section">
+        <h3>Amenities</h3>
+        <div class="amenity-tags">
+          ${p.amenities.map(a => h`<span class="amenity-tag">${esc(a)}</span>`).join('')}
+        </div>
+      </div>
+
+      <div class="detail-section calc-preview">
+        <h3>Quick EMI Estimate</h3>
+        <div class="emi-preview">
+          <div class="emi-row"><span>Property Price</span><span>₹${fmtNum(p.price)}</span></div>
+          <div class="emi-row"><span>Down Payment (20%)</span><span>₹${fmtNum(p.price * 0.2)}</span></div>
+          <div class="emi-row"><span>Loan Amount</span><span>₹${fmtNum(p.price * 0.8)}</span></div>
+          <div class="emi-row"><span>Rate (SBI)</span><span>8.50%</span></div>
+          <div class="emi-row emi-total"><span>Monthly EMI</span><span>₹${fmtNum(emi)}</span></div>
+        </div>
+        <div class="emi-actions">
+          <button class="btn-outline" onclick="window._hn.nav('emi')">Full EMI Calculator →</button>
+          <a href="${waShareEMI(p.price, 8.5, 20, emi)}" target="_blank" rel="noopener" class="wa-share-btn">
+            <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+            Share EMI
+          </a>
+        </div>
+      </div>
+
+      ${guide ? h`
+      <div class="detail-section">
+        <h3>📍 ${esc(p.locality)} Area Guide</h3>
+        <div class="area-mini">
+          <div><strong>Avg Price:</strong> ${esc(guide.avgPrice)}</div>
+          <div><strong>Trend:</strong> ${esc(guide.trend)}</div>
+          <div><strong>Metro:</strong> ${esc(guide.metro)}</div>
+          <div><strong>Vibe:</strong> ${esc(guide.vibe)}</div>
+        </div>
+        <button class="btn-outline" onclick="window._hn.nav('areas')">Full Area Guide →</button>
+      </div>` : ''}
+
+      <div class="detail-section">
+        <h3>Contact via WhatsApp</h3>
+        <a href="https://wa.me/919845012345?text=${encodeURIComponent(`Hi, I'm interested in ${p.title} (${p.bhk}) in ${p.locality} listed at ${p.priceLabel} on HomeNex.`)}" target="_blank" rel="noopener" class="wa-contact-btn">
+          <svg viewBox="0 0 24 24" class="wa-icon-md"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+          Chat with Agent on WhatsApp
+        </a>
+        <a href="${waShareProperty(p)}" target="_blank" rel="noopener" class="wa-family-btn">
+          👨‍👩‍👧‍👦 Share with Family on WhatsApp
+        </a>
+      </div>
+
+      ${similar.length ? h`
+      <div class="detail-section">
+        <h3>Similar Properties</h3>
+        <div class="property-scroll">
+          ${similar.map(s => propertyCard(s)).join('')}
+        </div>
+      </div>` : ''}
+    </div>
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: EMI CALCULATOR
+// ---------------------------------------------------------------------------
+function screenEMI() {
+  return h`
+  <div class="screen-content" data-screen="emi">
+    <div class="section">
+      <h1 class="tool-title">🧮 EMI Calculator</h1>
+      <p class="tool-sub">Calculate monthly home loan EMI instantly. No login needed.</p>
+
+      <div class="calc-card">
+        <div class="calc-field">
+          <label>Property Price (₹)</label>
+          <input type="number" id="emi-price" value="7500000" min="100000" step="100000" oninput="window._hn.recalcEMI()" />
+          <input type="range" id="emi-price-range" min="1000000" max="100000000" step="500000" value="7500000" oninput="$('#emi-price').value=this.value;window._hn.recalcEMI()" />
+        </div>
+        <div class="calc-field">
+          <label>Down Payment (%)</label>
+          <input type="number" id="emi-dp" value="20" min="0" max="80" oninput="window._hn.recalcEMI()" />
+          <input type="range" id="emi-dp-range" min="0" max="80" step="5" value="20" oninput="$('#emi-dp').value=this.value;window._hn.recalcEMI()" />
+        </div>
+        <div class="calc-field">
+          <label>Interest Rate (% p.a.)</label>
+          <input type="number" id="emi-rate" value="8.5" min="5" max="15" step="0.05" oninput="window._hn.recalcEMI()" />
+          <input type="range" id="emi-rate-range" min="500" max="1500" step="5" value="850" oninput="$('#emi-rate').value=(this.value/100).toFixed(2);window._hn.recalcEMI()" />
+        </div>
+        <div class="calc-field">
+          <label>Loan Tenure (years)</label>
+          <input type="number" id="emi-years" value="20" min="1" max="30" oninput="window._hn.recalcEMI()" />
+          <input type="range" id="emi-years-range" min="1" max="30" step="1" value="20" oninput="$('#emi-years').value=this.value;window._hn.recalcEMI()" />
+        </div>
+      </div>
+
+      <div class="calc-result" id="emi-result"></div>
+
+      <div class="section" style="margin-top:28px">
+        <h2 class="section-title">Current Home Loan Rates</h2>
+        <div class="rates-table">
+          <div class="rate-row rate-header">
+            <span>Bank</span><span>Rate</span><span>Max Tenure</span>
+          </div>
+          ${BANK_RATES.map(b => h`
+            <div class="rate-row" onclick="$('#emi-rate').value='${b.rate}';window._hn.recalcEMI()">
+              <span class="rate-bank">${esc(b.bank)}</span>
+              <span class="rate-val">${b.rate}%</span>
+              <span>${b.maxTenure} yrs</span>
+            </div>`).join('')}
+        </div>
+        <p class="rates-note">Tap a bank to use its rate. Rates are indicative and subject to change.</p>
+      </div>
+    </div>
+  </div>`
+}
+
+function recalcEMI() {
+  const price = parseFloat($('#emi-price')?.value) || 0
+  const dp = parseFloat($('#emi-dp')?.value) || 20
+  const rate = parseFloat($('#emi-rate')?.value) || 8.5
+  const years = parseInt($('#emi-years')?.value) || 20
+  const loan = price * (1 - dp / 100)
+  const emi = calcEMI(loan, rate, years)
+  const totalPay = emi * years * 12
+  const totalInterest = totalPay - loan
+
+  const el = $('#emi-result')
+  if (!el) return
+
+  el.innerHTML = h`
+    <div class="result-big">
+      <span class="result-label">Monthly EMI</span>
+      <span class="result-value">₹${fmtNum(emi)}</span>
+    </div>
+    <div class="result-grid">
+      <div><span class="rg-label">Loan Amount</span><span class="rg-value">₹${fmtNum(loan)}</span></div>
+      <div><span class="rg-label">Total Interest</span><span class="rg-value">₹${fmtNum(totalInterest)}</span></div>
+      <div><span class="rg-label">Total Payment</span><span class="rg-value">₹${fmtNum(totalPay)}</span></div>
+    </div>
+    <div class="emi-bar">
+      <div class="emi-bar-principal" style="width:${(loan / totalPay * 100).toFixed(1)}%">Principal</div>
+      <div class="emi-bar-interest">Interest</div>
+    </div>
+    <a href="${waShareEMI(price, rate, years, emi)}" target="_blank" rel="noopener" class="wa-share-btn-full">
+      <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+      Share EMI on WhatsApp
+    </a>`
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: STAMP DUTY CALCULATOR
+// ---------------------------------------------------------------------------
+function screenStampDuty() {
+  const states = Object.keys(STAMP_DUTY_RATES)
+  return h`
+  <div class="screen-content" data-screen="stamp-duty">
+    <div class="section">
+      <h1 class="tool-title">📋 Stamp Duty Calculator</h1>
+      <p class="tool-sub">Know the exact stamp duty & registration charges before you buy.</p>
+
+      <div class="calc-card">
+        <div class="calc-field">
+          <label>State</label>
+          <select id="sd-state" onchange="window._hn.recalcSD()">
+            ${states.map(s => h`<option value="${esc(s)}">${esc(s)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="calc-field">
+          <label>Property Value (₹)</label>
+          <input type="number" id="sd-price" value="7500000" min="100000" step="100000" oninput="window._hn.recalcSD()" />
+          <input type="range" id="sd-price-range" min="1000000" max="100000000" step="500000" value="7500000" oninput="$('#sd-price').value=this.value;window._hn.recalcSD()" />
+        </div>
+        <div class="calc-field">
+          <label>Buyer Gender</label>
+          <div class="radio-group">
+            <label class="radio"><input type="radio" name="sd-gender" value="male" checked onchange="window._hn.recalcSD()" /> Male</label>
+            <label class="radio"><input type="radio" name="sd-gender" value="female" onchange="window._hn.recalcSD()" /> Female</label>
+            <label class="radio"><input type="radio" name="sd-gender" value="joint" onchange="window._hn.recalcSD()" /> Joint</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="calc-result" id="sd-result"></div>
+
+      <div class="section" style="margin-top:28px">
+        <h2 class="section-title">Stamp Duty Rates by State</h2>
+        <div class="rates-table">
+          <div class="rate-row rate-header">
+            <span>State</span><span>Male</span><span>Female</span><span>Reg.</span>
+          </div>
+          ${states.map(s => {
+            const r = STAMP_DUTY_RATES[s]
+            return h`
+            <div class="rate-row">
+              <span class="rate-bank">${esc(s)}</span>
+              <span>${r.male}%</span>
+              <span>${r.female}%</span>
+              <span>${r.reg}%</span>
+            </div>`
+          }).join('')}
+        </div>
+      </div>
+    </div>
+  </div>`
+}
+
+function recalcSD() {
+  const state = $('#sd-state')?.value || 'Karnataka'
+  const price = parseFloat($('#sd-price')?.value) || 0
+  const gender = document.querySelector('input[name="sd-gender"]:checked')?.value || 'male'
+  const rates = STAMP_DUTY_RATES[state]
+  if (!rates) return
+
+  const sdRate = rates[gender] + (rates.cess || 0)
+  const regRate = rates.reg
+  const stampDuty = price * sdRate / 100
+  const regCharges = price * regRate / 100
+  const total = stampDuty + regCharges
+
+  const el = $('#sd-result')
+  if (!el) return
+
+  el.innerHTML = h`
+    <div class="result-big">
+      <span class="result-label">Total Extra Cost</span>
+      <span class="result-value">₹${fmtNum(total)}</span>
+    </div>
+    <div class="result-grid">
+      <div><span class="rg-label">Stamp Duty (${sdRate}%)</span><span class="rg-value">₹${fmtNum(stampDuty)}</span></div>
+      <div><span class="rg-label">Registration (${regRate}%)</span><span class="rg-value">₹${fmtNum(regCharges)}</span></div>
+      <div><span class="rg-label">Property Value</span><span class="rg-value">₹${fmtNum(price)}</span></div>
+    </div>
+    <p class="sd-tip">💡 Tip: In ${esc(state)}, female buyers ${rates.female < rates.male ? 'save ' + (rates.male - rates.female) + '% on stamp duty!' : 'pay the same rate as male buyers.'}</p>
+    <a href="${waShareStampDuty(state, price, stampDuty, regCharges)}" target="_blank" rel="noopener" class="wa-share-btn-full">
+      <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+      Share on WhatsApp
+    </a>`
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: AREA GUIDES
+// ---------------------------------------------------------------------------
+function screenAreas() {
+  const areas = Object.entries(AREA_GUIDES)
+  return h`
+  <div class="screen-content" data-screen="areas">
+    <div class="section">
+      <h1 class="tool-title">📍 Area Guides</h1>
+      <p class="tool-sub">Price trends, connectivity, schools & hospitals for popular localities.</p>
+
+      <div class="area-cards">
+        ${areas.map(([name, g]) => h`
+          <div class="area-card">
+            <h3>${esc(name)}</h3>
+            <p class="area-vibe">${esc(g.vibe)}</p>
+            <div class="area-stats">
+              <div><span class="as-label">Avg Price</span><span class="as-value">${esc(g.avgPrice)}</span></div>
+              <div><span class="as-label">Trend</span><span class="as-value trend-up">${esc(g.trend)}</span></div>
+              <div><span class="as-label">Metro</span><span class="as-value">${esc(g.metro)}</span></div>
+            </div>
+            <div class="area-details">
+              <p><strong>Schools:</strong> ${esc(g.schools)}</p>
+              <p><strong>Hospitals:</strong> ${esc(g.hospitals)}</p>
+            </div>
+            <div class="area-actions">
+              <button class="btn-outline" onclick="window._hn.searchLocality('${esc(name)}')">View Properties →</button>
+              <a href="https://wa.me/?text=${encodeURIComponent(`📍 Area Guide: ${name}\n\nAvg Price: ${g.avgPrice}\nTrend: ${g.trend}\n${g.vibe}\n\nExplore more → ${SITE_URL}#areas`)}" target="_blank" rel="noopener" class="wa-share-btn">
+                <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+                Share
+              </a>
+            </div>
           </div>`).join('')}
       </div>
-
-      <div class="mt28" data-tour="worklist">
-        <div class="flex items-center gap8">
-          <span class="section-head">YOUR DAY — WHAT TO DO NEXT</span>
-          <span class="count-pill">${WORKLIST.length}</span>
-        </div>
-        <div class="mt12" style="display:flex;flex-direction:column;gap:10px">
-          ${WORKLIST.map((w) => h`
-            <div class="card">
-              <div class="work-item">
-                <span class="pri ${w.priority}">${w.label}</span>
-                <div class="g1" style="min-width:0">
-                  <p class="b fs13" style="color:var(--ink)">${esc(w.title)}</p>
-                  <p class="fs12 muted mt4" style="line-height:1.35">${esc(w.reason)}</p>
-                </div>
-                <span class="arrow">→</span>
-              </div>
-            </div>`).join('')}
-        </div>
-      </div>
-
-      <div class="mt28" data-tour="activity">
-        <div class="flex items-center gap8">
-          <span style="position:relative;display:inline-flex;width:8px;height:8px">
-            <span style="position:absolute;inset:0;border-radius:999px;background:var(--hot);opacity:.6;animation:focuspulse 1.6s infinite"></span>
-            <span style="position:relative;width:8px;height:8px;border-radius:999px;background:var(--hot)"></span>
-          </span>
-          <span class="fs11 b8" style="letter-spacing:.18em;color:var(--ink)">LIVE <span class="faint" style="font-weight:600">Activity</span></span>
-        </div>
-        <div class="card mt12 divide">
-          ${ACTIVITY.map((a) => h`
-            <div class="row" style="padding:11px 16px;align-items:flex-start">
-              <span style="flex:0 0 auto;width:6px;height:6px;border-radius:999px;margin-top:6px;background:${a.kind === 'ai' ? 'var(--brand)' : a.kind === 'hot' ? 'var(--hot)' : a.kind === 'agent' ? 'var(--amber)' : 'var(--ink-faint)'}"></span>
-              <p class="fs12 g1" style="line-height:1.35;color:var(--ink)">${esc(a.text)}</p>
-              <span class="fs11 faint tabnum" style="flex:0 0 auto">${esc(a.ago)}</span>
-            </div>`).join('')}
-        </div>
-      </div>
     </div>
-  </div>`
-}
-
-function leadCard(l) {
-  const initials = l.name.split(' ').map((w) => w[0]).slice(0, 2).join('')
-  return h`
-    <div class="lead-card">
-      <div class="top">
-        <span class="avatar sm">${initials}</span>
-        <div class="g1" style="min-width:0">
-          <p class="nm truncate">${esc(l.name)}</p>
-          <p class="sub truncate">${esc(l.bhk)} · ${esc(l.budget)} · ${esc(l.locality)}</p>
-        </div>
-      </div>
-      <div class="meta">
-        <span class="temp ${l.temp}">${tempEmoji(l.temp)} ${l.score}</span>
-        <span class="fs11 faint">${esc(l.ago)}</span>
-      </div>
-    </div>`
-}
-
-function screenLeads() {
-  const byStage = (st) => LEADS.filter((l) => l.stage === st)
-  const pipelines = [
-    { id: 'buy', label: 'Buy (Primary)', n: LEADS.filter((l) => l.pipeline === 'Buy (Primary)').length },
-    { id: 'resale', label: 'Buy (Resale)', n: 0 },
-    { id: 'rental', label: 'Rental', n: LEADS.filter((l) => l.pipeline === 'Rental').length },
-  ]
-  return h`
-  <div class="panel" data-screen="leads">
-    <div class="px" style="padding-top:26px">
-      <h1 class="h1">Leads</h1>
-      <p class="fs13 muted mt4">5 open in this pipeline · qualified by HomeNex AI</p>
-    </div>
-    <div class="chips mt16 px" data-tour="pipelines">
-      ${pipelines.map((p, i) => h`
-        <span class="chip ${i === 0 ? 'active' : ''}">${p.label}${p.n ? h`<span class="c-badge">${p.n}</span>` : ''}</span>`).join('')}
-    </div>
-    <div class="board mt16" data-tour="board">
-      ${PIPELINE_STAGES.map((st) => {
-        const col = byStage(st)
-        return h`
-        <div class="col" ${st === 'New' ? 'data-tour="col-new"' : ''}>
-          <div class="col-head">
-            <span class="st">${esc(st)}</span>
-            <span class="cnt">${col.length}</span>
-          </div>
-          ${col.map(leadCard).join('') || h`<div style="border:1px dashed var(--line);border-radius:16px;min-height:64px;display:grid;place-items:center;text-align:center;padding:10px"><span class="fs11 faint">Nothing here yet</span></div>`}
-        </div>`
-      }).join('')}
-    </div>
-  </div>`
-}
-
-function screenInbox() {
-  const c = CONVERSATION
-  const initials = c.name.split(' ').map((w) => w[0]).slice(0, 2).join('')
-  return h`
-  <div class="panel" data-screen="inbox">
-    <div class="chat-header">
-      <span class="avatar sm">${initials}</span>
-      <div class="g1" style="min-width:0">
-        <p class="b fs13" style="color:var(--ink)">${esc(c.name)}</p>
-        <p class="fs11 faint">${esc(c.wa)} · via WhatsApp</p>
-      </div>
-      <span class="temp Warm">☀️ 75</span>
-    </div>
-
-    <div class="chat-texture" data-tour="chat">
-      ${c.messages.map((m, i) => {
-        if (m.role === 'buyer') {
-          return h`
-          <div class="msg-wrap">
-            <div class="msg buyer">${esc(m.text)}<div class="t">${esc(m.time)}</div></div>
-          </div>`
-        }
-        const isAI = m.role === 'ai'
-        const badgeCls = isAI ? 'ai' : 'you'
-        const badgeTxt = m.mode
-        return h`
-        <div class="msg-wrap out" ${i === 1 ? 'data-tour="first-ai"' : ''}>
-          <span class="mode-badge ${badgeCls}">${isAI ? '⚡ ' : ''}${esc(badgeTxt)}</span>
-          <div class="msg out">${esc(m.text)}<div class="t">${esc(m.time)}</div></div>
-          ${m.meta ? h`<span class="meta-ai">✓ ${esc(m.meta)}</span>` : ''}
-        </div>`
-      }).join('')}
-    </div>
-
-    <div class="px" style="padding-top:16px;padding-bottom:20px" data-tour="captured">
-      <div class="flex items-center between">
-        <span class="section-head" style="color:var(--brand-deep)">✨ AI CAPTURED PREFERENCES</span>
-        <span class="mode-badge ai">Auto</span>
-      </div>
-      <div class="card mt12" style="padding:14px 16px">
-        <dl class="captured">
-          ${c.captured.map((p) => h`<dt>${esc(p.k)}</dt><dd>${esc(p.v)}</dd>`).join('')}
-        </dl>
-        <p class="fs11 muted mt12" style="line-height:1.4">Extracted automatically from the chat — no form-filling. Feeds the lead score & property matching.</p>
-      </div>
-    </div>
-  </div>`
-}
-
-function scoreRing(score) {
-  const size = 48, r = (size - 6) / 2, c = 2 * Math.PI * r
-  const color = score >= 80 ? 'var(--hot)' : score >= 55 ? 'var(--brand)' : 'var(--ink-faint)'
-  return h`
-    <div class="score-ring">
-      <svg width="${size}" height="${size}" style="transform:rotate(-90deg)">
-        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--line)" stroke-width="4"/>
-        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="${color}" stroke-width="4"
-          stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - score / 100)}"/>
-      </svg>
-      <span class="val" style="color:${color}">${score}</span>
-    </div>`
-}
-
-function screenDetail() {
-  const d = LEAD_DETAIL
-  return h`
-  <div class="panel" data-screen="detail">
-    <div class="detail-head">
-      <span class="avatar sm">←</span>
-      <div class="g1" style="min-width:0">
-        <p class="font-display b fs13" style="font-size:17px;color:var(--ink)">${esc(d.name)}</p>
-        <p class="fs11 faint truncate">${esc(d.pipeline)} · ${esc(d.wa)} · ${esc(d.updated)}</p>
-      </div>
-      ${scoreRing(d.score)}
-    </div>
-
-    <div class="px" style="padding-top:18px;display:flex;flex-direction:column;gap:16px">
-
-      <div class="card" style="padding:16px" data-tour="briefing">
-        <div class="flex items-center between">
-          <span class="section-head" style="color:var(--ink-soft)">📞 BEFORE YOU CALL</span>
-          <span class="temp Warm">${d.briefing.temperature} ${d.score}</span>
-        </div>
-        ${d.briefing.points.map((p) => h`<div class="briefing-pt ${p.tone}">${esc(p.text)}</div>`).join('')}
-        <p class="fs12 muted mt12"><b style="color:var(--ink)">Still to learn:</b> ${d.briefing.missing.map(esc).join(' · ')}</p>
-      </div>
-
-      <div style="background:var(--brand-wash);border:1px solid rgba(22,101,52,.2);border-radius:18px;padding:16px" data-tour="capture">
-        <div class="flex items-center between" style="margin-bottom:8px">
-          <span class="section-head" style="color:var(--brand-deep)">✨ AI CAPTURE</span>
-          <span class="temp Warm" style="text-transform:uppercase">${d.ai_score}</span>
-        </div>
-        <dl class="captured">
-          ${d.capture.map((p) => h`<dt style="width:78px">${esc(p.k)}</dt><dd>${esc(p.v)}${p.note ? h` <span class="muted">— ${esc(p.note)}</span>` : ''}</dd>`).join('')}
-        </dl>
-        <p class="fs12 muted mt12"><b style="color:var(--ink)">Why ${esc(d.ai_score)}:</b> ${esc(d.ai_score_reason)}</p>
-        <p class="fs12 muted mt6"><b style="color:var(--ink)">Next step:</b> ${esc(d.next_step)}</p>
-      </div>
-
-      <div class="card" style="padding:16px" data-tour="breakdown">
-        <p class="section-head" style="color:var(--ink-soft);margin-bottom:12px">SCORE BREAKDOWN · ${d.score}/100</p>
-        <div style="display:flex;flex-direction:column;gap:12px">
-          ${d.breakdown.map((s) => h`
-            <div>
-              <div class="flex between fs12" style="margin-bottom:5px">
-                <span class="b" style="color:var(--ink)">${esc(s.label)}</span>
-                <span class="b tabnum muted">${s.value}</span>
-              </div>
-              <div class="bar"><span class="${s.value >= 80 ? 'high' : ''}" style="width:${s.value}%"></span></div>
-            </div>`).join('')}
-        </div>
-      </div>
-
-      <div class="card" data-tour="followups">
-        <p class="section-head" style="color:var(--ink-soft);padding:16px 16px 4px">FOLLOW-UPS</p>
-        <div class="divide">
-          ${d.followups.map((f) => h`
-            <div class="row" style="padding:11px 16px">
-              <span class="check ${f.done ? 'done' : ''}">✓</span>
-              <div class="g1" style="min-width:0">
-                <p class="fs13 b truncate" style="color:${f.done ? 'var(--ink-faint)' : 'var(--ink)'};${f.done ? 'text-decoration:line-through' : ''}">${esc(f.note)}</p>
-              </div>
-              <span class="fs11 faint tabnum" style="flex:0 0 auto">${esc(f.due)}</span>
-            </div>`).join('')}
-        </div>
-      </div>
-
-      <div class="card" data-tour="visits" style="margin-bottom:8px">
-        <p class="section-head" style="color:var(--ink-soft);padding:16px 16px 4px">SITE VISITS</p>
-        <div class="divide">
-          ${d.visits.map((v) => h`
-            <div class="row" style="padding:12px 16px">
-              <span style="font-size:18px">🏗️</span>
-              <div class="g1" style="min-width:0">
-                <p class="fs13 b truncate" style="color:var(--ink)">${esc(v.property)}</p>
-                <p class="fs12 muted">${esc(v.when)} · ${esc(v.status)}${v.pickup ? ' · 🚗 pickup' : ''}</p>
-              </div>
-            </div>`).join('')}
-        </div>
-      </div>
-
-    </div>
-  </div>`
-}
-
-function screenProperties() {
-  const bands = ['Any price', '< ₹50L', '₹50L–1Cr', '₹1–2.5Cr', '> ₹2.5Cr']
-  const statusLabel = (s) => (s === 'ready' ? '✅ Ready to move' : '🏗️ Under construction')
-  return h`
-  <div class="panel" data-screen="properties">
-    <div class="px" style="padding-top:26px">
-      <h1 class="h1">Properties</h1>
-      <p class="fs13 muted mt4">6 listings · auto-matched to every lead's budget & locality</p>
-    </div>
-    <div class="chips mt16 px" data-tour="prop-filters">
-      ${bands.map((b, i) => h`<span class="chip ${i === 0 ? 'active' : ''}">${b}</span>`).join('')}
-    </div>
-    <div class="mt16" data-tour="prop-list">
-      <div class="card" style="margin:0 20px" >
-        <div class="divide">
-          ${PROPERTIES.map((p) => h`
-            <div class="prop">
-              <span class="thumb">${p.status === 'ready' ? '🏢' : '🏗️'}</span>
-              <div class="g1" style="min-width:0">
-                <p class="p-title truncate">${esc(p.title)}</p>
-                <p class="p-sub truncate">${esc(p.bhk)} · ${esc(p.type)} · ${esc(p.locality)} · ${esc(p.area)}</p>
-                <p class="p-status">${statusLabel(p.status)}${p.rera ? ' · RERA ✓' : ''}${p.match ? h` · <span class="match-pill">✨ ${esc(p.match)}</span>` : ''}</p>
-              </div>
-              <span class="p-price">${esc(p.price)}</span>
-            </div>`).join('')}
-        </div>
-      </div>
-    </div>
-    <div style="height:20px"></div>
   </div>`
 }
 
 // ---------------------------------------------------------------------------
-// BOTTOM NAV
+// SCREEN: COMPARE
 // ---------------------------------------------------------------------------
-function bottomNav() {
-  const ico = {
-    home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/>',
-    leads: '<rect x="3" y="4" width="5" height="16" rx="1.2"/><rect x="10" y="4" width="5" height="10" rx="1.2"/><rect x="17" y="4" width="4" height="13" rx="1.2"/>',
-    properties: '<path d="M3 21h18"/><path d="M5 21V7l7-4 7 4v14"/><path d="M9 9h.01M15 9h.01M9 13h.01M15 13h.01"/>',
-    more: '<circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>',
+function screenCompare(idsStr) {
+  const ids = idsStr ? idsStr.split(',') : compareList
+  const props = ids.map(id => PROPERTIES.find(p => p.id === id)).filter(Boolean)
+
+  if (props.length < 2) {
+    return h`
+    <div class="screen-content" data-screen="compare">
+      <div class="section" style="text-align:center;padding-top:60px">
+        <span style="font-size:48px">⚖️</span>
+        <h1 style="margin-top:16px">Compare Properties</h1>
+        <p class="tool-sub">Select 2–4 properties from search results to compare side by side.</p>
+        <button class="btn-primary" onclick="window._hn.nav('search')" style="margin-top:20px">Browse Properties →</button>
+      </div>
+    </div>`
   }
-  const svg = (p) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`
+
   return h`
-  <nav class="botnav">
-    <button data-nav="dashboard">${svg(ico.home)}<span>Home</span></button>
-    <button data-nav="leads">${svg(ico.leads)}<span>Leads</span></button>
-    <button data-nav="inbox" class="fab">
-      <span class="fab-circle"><svg viewBox="0 0 24 24"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Zm0 3.1 1.1 2.9 3 .3-2.3 2 .7 3-2.5-1.7-2.5 1.7.7-3-2.3-2 3-.3L12 5.3Z"/></svg></span>
-      <span>Inbox</span>
-    </button>
-    <button data-nav="properties">${svg(ico.properties)}<span>Properties</span></button>
-    <button data-nav="more"><span class="badge">3</span>${svg(ico.more)}<span>More</span></button>
+  <div class="screen-content" data-screen="compare">
+    <div class="section">
+      <div class="flex between items-center" style="flex-wrap:wrap;gap:12px">
+        <div>
+          <h1 class="tool-title" style="margin-bottom:4px">⚖️ Property Comparison</h1>
+          <p class="tool-sub">Comparing ${props.length} properties side by side</p>
+        </div>
+        <a href="${waShareComparison(ids)}" target="_blank" rel="noopener" class="wa-share-btn-lg">
+          <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+          Share Comparison
+        </a>
+      </div>
+
+      <div class="compare-table-wrap">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th></th>
+              ${props.map(p => h`<th><div class="ct-head">${p.img}<br>${esc(p.title)}</div></th>`).join('')}
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Price</td>${props.map(p => h`<td class="ct-price">${esc(p.priceLabel)}</td>`).join('')}</tr>
+            <tr><td>EMI/mo</td>${props.map(p => h`<td>₹${fmtNum(calcEMI(p.price * 0.8, 8.5, 20))}</td>`).join('')}</tr>
+            <tr><td>Config</td>${props.map(p => h`<td>${esc(p.bhk)}</td>`).join('')}</tr>
+            <tr><td>Area</td>${props.map(p => h`<td>${p.area} sq.ft</td>`).join('')}</tr>
+            <tr><td>₹/sq.ft</td>${props.map(p => h`<td>₹${fmtNum(p.price / p.area)}</td>`).join('')}</tr>
+            <tr><td>Location</td>${props.map(p => h`<td>${esc(p.locality)}, ${esc(p.city)}</td>`).join('')}</tr>
+            <tr><td>Builder</td>${props.map(p => h`<td>${esc(p.builder)}</td>`).join('')}</tr>
+            <tr><td>Status</td>${props.map(p => h`<td>${p.status === 'ready' ? '✅ Ready' : '🏗️ UC'}</td>`).join('')}</tr>
+            <tr><td>RERA</td>${props.map(p => h`<td>${p.rera ? '✓' : '—'}</td>`).join('')}</tr>
+            <tr><td>Floor</td>${props.map(p => h`<td>${esc(p.floors)}</td>`).join('')}</tr>
+            <tr><td>Facing</td>${props.map(p => h`<td>${esc(p.facing)}</td>`).join('')}</tr>
+            <tr><td>Parking</td>${props.map(p => h`<td>${p.parking}</td>`).join('')}</tr>
+            <tr><td>Year</td>${props.map(p => h`<td>${p.yearBuilt}</td>`).join('')}</tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="compare-cta">
+        <a href="${waShareComparison(ids)}" target="_blank" rel="noopener" class="wa-family-btn">
+          👨‍👩‍👧‍👦 Share comparison with family on WhatsApp
+        </a>
+      </div>
+    </div>
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN: FAVORITES (local, no login)
+// ---------------------------------------------------------------------------
+function screenFavorites() {
+  const props = favorites.map(id => PROPERTIES.find(p => p.id === id)).filter(Boolean)
+  return h`
+  <div class="screen-content" data-screen="favorites">
+    <div class="section">
+      <h1 class="tool-title">❤️ Saved Properties</h1>
+      <p class="tool-sub">${props.length ? `${props.length} saved properties (stored in your browser)` : 'No saved properties yet. Browse and tap ❤️ to save.'}</p>
+
+      ${props.length ? h`
+        <div class="property-grid">
+          ${props.map(p => propertyCard(p)).join('')}
+        </div>
+        <div style="margin-top:20px;text-align:center">
+          <a href="${waShareComparison(favorites)}" target="_blank" rel="noopener" class="wa-share-btn-full" style="display:inline-flex">
+            <svg viewBox="0 0 24 24" class="wa-icon-sm"><path d="M12 2.2C6.6 2.2 2.2 6.4 2.2 11.6c0 1.9.6 3.7 1.6 5.2L2.4 21l4.4-1.3c1.5.9 3.3 1.4 5.2 1.4 5.4 0 9.8-4.2 9.8-9.4S17.4 2.2 12 2.2Z"/></svg>
+            Share all saved on WhatsApp
+          </a>
+        </div>
+      ` : h`
+        <div class="empty-state">
+          <span class="empty-icon">🏠</span>
+          <p>Browse properties and tap the heart to save them here.</p>
+          <button class="btn-primary" onclick="window._hn.nav('search')" style="margin-top:16px">Browse Properties →</button>
+        </div>
+      `}
+    </div>
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// EMBEDDABLE WIDGET GENERATOR
+// ---------------------------------------------------------------------------
+function screenWidget() {
+  const code = `<!-- HomeNex Property Rates Widget -->
+<div id="homenex-widget" style="max-width:400px;font-family:sans-serif"></div>
+<script>
+(function(){
+  var d=document,s=d.createElement('script');
+  s.src='${SITE_URL}/widget.js';
+  s.async=true;
+  d.getElementById('homenex-widget').appendChild(s);
+})();
+</script>`
+
+  return h`
+  <div class="screen-content" data-screen="widget">
+    <div class="section">
+      <h1 class="tool-title">🔌 Embed Property Widget</h1>
+      <p class="tool-sub">Add live property rates to your blog or portal. Free.</p>
+
+      <div class="widget-preview">
+        <div class="widget-demo">
+          <div class="widget-demo-header">
+            <span>🏡</span> Property Rates · Whitefield, Bengaluru
+          </div>
+          <div class="widget-demo-body">
+            <div class="wd-row"><span>Brigade Cornerstone</span><span>₹78L</span></div>
+            <div class="wd-row"><span>Prestige Lakeside</span><span>₹1.35Cr</span></div>
+            <div class="wd-row"><span>Sobha Dream Acres</span><span>₹62L</span></div>
+          </div>
+          <div class="widget-demo-footer">
+            Powered by <a href="${SITE_URL}">HomeNex</a> · Updated daily
+          </div>
+        </div>
+      </div>
+
+      <div class="calc-card" style="margin-top:20px">
+        <label style="font-weight:700;font-size:13px;color:var(--ink)">Embed Code</label>
+        <textarea class="embed-code" id="widget-code" readonly rows="6">${esc(code)}</textarea>
+        <button class="btn-primary" style="margin-top:12px" onclick="navigator.clipboard?.writeText(document.getElementById('widget-code').value);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy Embed Code',2000)">Copy Embed Code</button>
+      </div>
+    </div>
+  </div>`
+}
+
+// ---------------------------------------------------------------------------
+// NAVBAR + FOOTER
+// ---------------------------------------------------------------------------
+function navbar() {
+  return h`
+  <nav class="navbar" id="navbar">
+    <div class="nav-inner">
+      <a class="nav-brand" href="#home" onclick="window._hn.nav('home')">
+        <span class="nav-logo">🏡</span>
+        <span class="nav-name">HomeNex</span>
+      </a>
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="nav-links" id="nav-links">
+        <a href="#search" onclick="window._hn.nav('search')">Properties</a>
+        <a href="#emi" onclick="window._hn.nav('emi')">EMI Calculator</a>
+        <a href="#stamp-duty" onclick="window._hn.nav('stamp-duty')">Stamp Duty</a>
+        <a href="#areas" onclick="window._hn.nav('areas')">Area Guides</a>
+        <a href="#favorites" onclick="window._hn.nav('favorites')" class="nav-fav">❤️ <span id="fav-count">${favorites.length || ''}</span></a>
+      </div>
+    </div>
   </nav>`
 }
 
-// ---------------------------------------------------------------------------
-// TOUR STEPS
-// ---------------------------------------------------------------------------
-const STEPS = [
-  { intro: true },
-  {
-    screen: 'dashboard', focus: null, nav: 'dashboard',
-    title: 'The home screen',
-    body: 'Every morning opens here. HomeNex greets the broker and summarises overnight activity — because buyers message on WhatsApp at all hours, and every one became a lead automatically.',
-    ai: 'The AI answered inbound WhatsApp messages through the night, so nothing sat unread until morning.',
-  },
-  {
-    screen: 'dashboard', focus: 'kpis',
-    title: 'Four numbers that run the day',
-    body: 'Waiting for reply, hot leads, follow-ups due, and site visits — the only stats a busy broker needs at a glance. The amber tiles are the ones that need action now.',
-    ai: 'AI keeps “waiting for reply” low by auto-answering in seconds — the 12 here are ones flagged for a human touch.',
-  },
-  {
-    screen: 'dashboard', focus: 'wa-chip',
-    title: 'WhatsApp, always connected',
-    body: 'A single compact chip confirms the WhatsApp Business number is live. Buyers only ever see WhatsApp — this dashboard is the broker\'s private cockpit behind it.',
-    ai: 'One Meta number powers everything; replies go out from the broker\'s own WhatsApp identity.',
-  },
-  {
-    screen: 'dashboard', focus: 'worklist',
-    title: 'Your day, prioritised',
-    body: '“What to do next” ranks every pending action by urgency — NOW, HIGH, SOON — so the broker works the highest-value lead first instead of scrolling a flat list.',
-    ai: 'Priority is computed from lead score, wait time, and pipeline stage — not manual tagging.',
-  },
-  {
-    screen: 'leads', focus: 'board', nav: 'leads',
-    title: 'The lead pipeline',
-    body: 'A drag-and-drop kanban across stages — New, Qualified, Site Visit, Negotiation. Six live buyers here, each captured from a WhatsApp chat and dropped into the right column.',
-    ai: 'Leads self-qualify: the AI extracts budget, location, timeline & config from conversation and advances the stage.',
-  },
-  {
-    screen: 'leads', focus: 'col-new',
-    title: 'Auto-captured, auto-scored',
-    body: 'Every card shows BHK, budget, locality, a temperature (🔥/☀️/❄️) and a 0–100 score. Rahul Sharma just messaged about a 2BHK in Whitefield — already scored 75.',
-    ai: 'No data entry. Cards populate themselves from the buyer\'s own words in WhatsApp.',
-  },
-  {
-    screen: 'inbox', focus: 'chat', nav: 'inbox',
-    title: 'The WhatsApp inbox',
-    body: 'Here is the actual conversation. Rahul asked for “a 2BHK in Whitefield under 80 lakhs” — and got a helpful, on-brand reply before he could switch tabs.',
-    ai: 'The AI understands intent, pulls matching listings, and writes like the broker would.',
-  },
-  {
-    screen: 'inbox', focus: 'first-ai',
-    title: 'Answered in 22 seconds',
-    body: 'The green ⚡ Auto-reply badge marks messages the AI sent on its own. It suggested three real matching properties and asked the right qualifying question — instantly, even at 2 AM.',
-    ai: 'Every lead answered in under 30 seconds. Speed-to-lead is the #1 driver of conversion in real estate.',
-  },
-  {
-    screen: 'inbox', focus: 'captured',
-    title: 'Auto-reply vs. You replied',
-    body: 'When the broker steps in, the badge switches to the amber “You replied” — a clear record of what was automated and what was personal. Below, the AI has already filled the buyer profile.',
-    ai: 'Budget, location, config & timeline are captured silently as the chat unfolds — feeding the score and matching.',
-  },
-  {
-    screen: 'detail', focus: 'briefing', nav: 'leads',
-    title: '“Before you call” coaching',
-    body: 'Open any lead and HomeNex briefs the broker before they dial — urgency, family context, budget guardrails, and what to lead with. No scrolling old chats to remember who this is.',
-    ai: 'Talking points are generated from the full conversation history, ranked by what will move the deal.',
-  },
-  {
-    screen: 'detail', focus: 'capture',
-    title: 'The buyer profile & score',
-    body: 'The BLTC profile (Budget · Location · Timeline · Config) and the reasoning behind the score sit together, with a clear “next step” the broker can act on immediately.',
-    ai: 'The AI explains its own score — “why warm” — instead of showing an opaque number.',
-  },
-  {
-    screen: 'detail', focus: 'breakdown',
-    title: 'How the 75 is built',
-    body: 'The score breaks down into budget clarity, location fit, timeline urgency, engagement and loan readiness — so the broker sees exactly what to shore up (here: confirm the home loan).',
-    ai: 'Transparent scoring the broker can trust and coach against — not a black box.',
-  },
-  {
-    screen: 'detail', focus: 'followups',
-    title: 'Follow-ups & site visits',
-    body: 'Scheduled touch-points and booked visits live on the lead. Nothing slips: the Saturday 11 AM visit at Brigade Cornerstone is already on the calendar with a pickup arranged.',
-    ai: 'The AI proposes follow-up timing based on buyer heat — hot leads get chased sooner.',
-  },
-  {
-    screen: 'properties', focus: 'prop-list', nav: 'properties',
-    title: 'Your property inventory',
-    body: 'Six listings with everything Indian buyers ask for — locality, BHK, carpet area, price in L/Cr, RERA status. The green ✨ tags show which lead each property already matches.',
-    ai: 'Every property is auto-matched to every lead\'s budget & location, so the right suggestion is one tap away — exactly what powered Rahul\'s instant reply.',
-  },
-  { outro: true },
-]
-
-// ---------------------------------------------------------------------------
-// TOUR ENGINE
-// ---------------------------------------------------------------------------
-let current = 0
-let annotEl, appbodyEl
-
-function showScreen(name) {
-  document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('active', p.dataset.screen === name))
-  document.querySelectorAll('.botnav button').forEach((b) => b.classList.toggle('active', b.dataset.nav === name))
-  appbodyEl.scrollTop = 0
-}
-
-function clearFocus() {
-  document.querySelectorAll('.tour-focus').forEach((e) => e.classList.remove('tour-focus'))
-}
-
-function applyFocus(sel) {
-  clearFocus()
-  if (!sel) return
-  const target = document.querySelector(`[data-tour="${sel}"]`)
-  if (!target) return
-  target.classList.add('tour-focus')
-  // scroll target into view within the phone body
-  setTimeout(() => {
-    const top = target.offsetTop - 90
-    appbodyEl.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
-  }, 60)
-}
-
-function renderAnnot() {
-  const step = STEPS[current]
-  const total = STEPS.length
-
-  if (step.intro) {
-    annotEl.innerHTML = introOutroCard('intro')
-    hideHero(false)
-    el('hero-slot').innerHTML = heroOverlay('intro')
-    wireHero()
-    return
-  }
-  if (step.outro) {
-    annotEl.innerHTML = introOutroCard('outro')
-    el('hero-slot').innerHTML = heroOverlay('outro')
-    hideHero(false)
-    wireHero()
-    return
-  }
-
-  hideHero(true)
-  el('hero-slot').innerHTML = ''
-  showScreen(step.nav || step.screen)
-  applyFocus(step.focus)
-
-  const stepNum = current // 1-based excluding intro handled below
-  const pct = Math.round((current / (total - 1)) * 100)
-  const contentSteps = STEPS.filter((s) => !s.intro && !s.outro).length
-  const contentIdx = current // since intro is index 0, content steps are 1..N
-
-  annotEl.innerHTML = h`
-    <div class="sheet-handle" id="sheet-handle"></div>
-    <div class="step-of">Step ${contentIdx} of ${contentSteps} · ${screenLabel(step.screen)}</div>
-    <h2>${esc(step.title)}</h2>
-    <p class="body">${step.body}</p>
-    ${step.ai ? h`<div class="ai-note"><b>⚡ AI capability</b>${step.ai}</div>` : ''}
-    <div class="progress-track"><span style="width:${pct}%"></span></div>
-    <div class="nav">
-      <button class="btn btn-ghost" id="prev" ${current === 0 ? 'disabled' : ''}>← Back</button>
-      <button class="btn btn-primary" id="next">${current === total - 1 ? 'Finish' : 'Next →'}</button>
-    </div>
-    <div class="dots-nav" id="dots"></div>`
-
-  renderDots()
-  wireNav()
-}
-
-function screenLabel(s) {
-  return { dashboard: 'Dashboard', leads: 'Lead Pipeline', inbox: 'Inbox', detail: 'Lead Detail', properties: 'Properties' }[s] || ''
-}
-
-function renderDots() {
-  const dots = el('dots')
-  if (!dots) return
-  dots.innerHTML = STEPS.map((_, i) => `<i class="${i === current ? 'on' : ''}" data-dot="${i}"></i>`).join('')
-  dots.querySelectorAll('[data-dot]').forEach((d) => d.addEventListener('click', () => goTo(+d.dataset.dot)))
-}
-
-function introOutroCard(kind) {
-  if (kind === 'intro') {
-    return h`
-      <div class="step-of">Interactive product tour</div>
-      <h2>Welcome to HomeNex</h2>
-      <p class="body">A guided walk-through of the AI-powered WhatsApp lead manager built for Indian real estate brokers. Everything you'll see is a live-styled demo with sample data.</p>
-      <div class="ai-note"><b>⚡ What HomeNex does</b>Every buyer who messages your WhatsApp number becomes a lead — answered by AI in seconds, qualified, scored, and handed to you when it matters.</div>
-      <div class="nav"><button class="btn btn-primary" id="next">Start the tour →</button></div>
-      <div class="dots-nav" id="dots"></div>`
-  }
+function footer() {
   return h`
-    <div class="step-of">That's the tour</div>
-    <h2>Every lead answered<br>in 30 seconds</h2>
-    <p class="body">You've seen the dashboard, pipeline, AI inbox, lead intelligence and property matching. This was sample data — the real app connects your own WhatsApp number and runs it all for you.</p>
-    <div class="cta-links">
-      <a class="cta primary" href="${REAL_APP_URL}" target="_blank" rel="noopener">Try the real app →</a>
-      <a class="cta secondary" href="${PRODUCT_SITE_URL}">← Back to product site</a>
-    </div>
-    <div class="nav" style="margin-top:14px"><button class="btn btn-ghost" id="prev">← Back</button><button class="btn btn-primary" id="restart">Restart tour ↺</button></div>
-    <div class="dots-nav" id="dots"></div>`
-}
-
-function heroOverlay(kind) {
-  if (kind === 'intro') {
-    return h`
-      <div class="hero-overlay">
-        <span class="big-emoji">🏡</span>
-        <span class="badge2">HOMENEX · DEMO</span>
-        <h1>Every lead answered<br>in 30 seconds.<br>Even at 2 AM.</h1>
-        <p>AI-powered WhatsApp lead management for Indian real estate brokers.</p>
-        <div class="stat-line">
-          <div><div class="n">30s</div><div class="l">avg reply</div></div>
-          <div><div class="n">24×7</div><div class="l">AI on call</div></div>
-          <div><div class="n">0</div><div class="l">leads missed</div></div>
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <span>🏡</span> HomeNex
+        <p>Smart property search for Indian home buyers. 100% free, no login needed.</p>
+      </div>
+      <div class="footer-links">
+        <div>
+          <h4>Tools</h4>
+          <a href="#emi">EMI Calculator</a>
+          <a href="#stamp-duty">Stamp Duty Calculator</a>
+          <a href="#areas">Area Guides</a>
+          <a href="#widget">Embed Widget</a>
         </div>
-        <button class="start-btn" id="hero-start">Start the tour →</button>
-        <span class="mini">Sample data · no login needed</span>
-      </div>`
+        <div>
+          <h4>Cities</h4>
+          ${CITIES.map(c => h`<a href="#search" onclick="window._hn.setCity('${esc(c)}')">${esc(c)}</a>`).join('')}
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <p>Made with ❤️ for Indian home buyers · <a href="https://doaide.com" target="_blank" rel="noopener">DoAide</a></p>
+      </div>
+    </div>
+  </footer>`
+}
+
+// ---------------------------------------------------------------------------
+// RENDER ENGINE
+// ---------------------------------------------------------------------------
+function renderScreen(screen, param) {
+  currentScreen = screen
+  let content = ''
+
+  switch (screen) {
+    case 'home': content = screenHome(); break
+    case 'search': content = screenSearch(); break
+    case 'property': content = screenProperty(param); break
+    case 'emi': content = screenEMI(); break
+    case 'stamp-duty': content = screenStampDuty(); break
+    case 'areas': content = screenAreas(); break
+    case 'compare': content = screenCompare(param); break
+    case 'favorites': content = screenFavorites(); break
+    case 'widget': content = screenWidget(); break
+    default: content = screenHome(); screen = 'home'
   }
-  return h`
-    <div class="hero-overlay">
-      <span class="big-emoji">✅</span>
-      <span class="badge2">TOUR COMPLETE</span>
-      <h1>Ready to never miss<br>a lead again?</h1>
-      <p>Connect your WhatsApp Business number and let HomeNex answer, qualify and score every buyer.</p>
-      <button class="start-btn" id="hero-cta">Try the real app →</button>
-      <span class="mini" id="hero-restart" style="cursor:pointer;text-decoration:underline">Restart the tour</span>
-    </div>`
+
+  const app = $('#app')
+  app.innerHTML = navbar() + `<main id="main">${content}</main>` + footer()
+
+  // Update active nav
+  $$('.nav-links a').forEach(a => {
+    const href = a.getAttribute('href')?.replace('#', '')
+    a.classList.toggle('active', href === screen)
+  })
+
+  // Update fav count
+  const favCount = $('#fav-count')
+  if (favCount) favCount.textContent = favorites.length || ''
+
+  // Hamburger
+  const hamburger = $('#hamburger')
+  const navLinks = $('#nav-links')
+  if (hamburger) {
+    hamburger.onclick = () => {
+      navLinks.classList.toggle('open')
+      hamburger.classList.toggle('open')
+    }
+  }
+
+  // Scroll to top
+  window.scrollTo(0, 0)
+
+  // Post-render calculators
+  if (screen === 'emi') setTimeout(recalcEMI, 0)
+  if (screen === 'stamp-duty') setTimeout(recalcSD, 0)
+
+  // Track page view with Umami
+  if (typeof umami !== 'undefined') {
+    try { umami.track(props => ({ ...props, url: `/${screen}${param ? '/' + param : ''}` })) } catch {}
+  }
 }
 
-function hideHero(hidden) {
-  const slot = el('hero-slot')
-  if (slot) slot.style.display = hidden ? 'none' : 'block'
+// ---------------------------------------------------------------------------
+// GLOBAL API (called from inline handlers)
+// ---------------------------------------------------------------------------
+window._hn = {
+  nav: (target) => navigate(target.split('/')[0], target.split('/').slice(1).join('/')),
+  search: () => {
+    const city = $('#city-select')?.value
+    if (city) selectedCity = city
+    navigate('search')
+  },
+  setCity: (c) => { selectedCity = c; renderScreen('search') },
+  setBhk: (v) => { filters.bhk = v; renderScreen('search') },
+  setPrice: (v) => {
+    const [min, max] = v.split('-').map(Number)
+    filters.priceMin = min || 0
+    filters.priceMax = max === Infinity || isNaN(max) ? Infinity : max
+    renderScreen('search')
+  },
+  setStatus: (v) => { filters.status = v; renderScreen('search') },
+  fav: toggleFav,
+  compare: toggleCompare,
+  recalcEMI: recalcEMI,
+  recalcSD: recalcSD,
+  searchLocality: (name) => {
+    const prop = PROPERTIES.find(p => p.locality === name)
+    if (prop) selectedCity = prop.city
+    navigate('search')
+  },
 }
 
-function wireHero() {
-  const start = el('hero-start')
-  if (start) start.addEventListener('click', () => goTo(1))
-  const cta = el('hero-cta')
-  if (cta) cta.addEventListener('click', () => window.open(REAL_APP_URL, '_blank'))
-  const hr = el('hero-restart')
-  if (hr) hr.addEventListener('click', () => goTo(0))
-  wireNav()
-}
-
-function wireNav() {
-  const next = el('next'); const prev = el('prev'); const restart = el('restart')
-  if (next) next.addEventListener('click', () => goTo(current + 1))
-  if (prev) prev.addEventListener('click', () => goTo(current - 1))
-  if (restart) restart.addEventListener('click', () => goTo(0))
-}
-
-function goTo(i) {
-  current = Math.max(0, Math.min(STEPS.length - 1, i))
-  // collapse mobile sheet expanded state on step change
-  annotEl.classList.remove('collapsed')
-  renderAnnot()
-}
+// Make $ global for inline oninput handlers
+window.$ = $
 
 // ---------------------------------------------------------------------------
 // BOOT
 // ---------------------------------------------------------------------------
 function boot() {
-  el('app').innerHTML = h`
-    <div class="stage">
-      <div class="phone-col">
-        <div class="brandbar">
-          <span class="logo">🏡</span>
-          <div>
-            <div class="name">HomeNex</div>
-            <div class="tag">Interactive product tour</div>
-          </div>
-          <span class="demo-pill">DEMO</span>
-        </div>
-        <div class="device">
-          <div class="screen">
-            <div class="notch"></div>
-            <div class="statusbar">
-              <span>9:41</span>
-              <span class="dots">📶 &nbsp;🔋</span>
-            </div>
-            <div class="appbody" id="appbody">
-              ${screenDashboard()}
-              ${screenLeads()}
-              ${screenInbox()}
-              ${screenDetail()}
-              ${screenProperties()}
-              <div id="hero-slot"></div>
-            </div>
-            ${bottomNav()}
-          </div>
-        </div>
-      </div>
-      <aside class="annot" id="annot"></aside>
-    </div>`
-
-  annotEl = el('annot')
-  appbodyEl = el('appbody')
-
-  // bottom-nav is interactive: jump to the first tour step on that screen
-  document.querySelectorAll('.botnav button').forEach((b) => {
-    b.addEventListener('click', () => {
-      const scr = b.dataset.nav
-      const idx = STEPS.findIndex((s) => (s.nav || s.screen) === scr && !s.intro && !s.outro)
-      if (idx >= 0) goTo(idx)
-    })
-  })
-
-  // mobile: tap the handle to collapse/expand the annotation sheet
-  document.addEventListener('click', (e) => {
-    if (e.target && e.target.id === 'sheet-handle') annotEl.classList.toggle('collapsed')
-  })
-
-  // keyboard arrows
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowRight') goTo(current + 1)
-    if (e.key === 'ArrowLeft') goTo(current - 1)
-  })
-
-  showScreen('dashboard')
-  renderAnnot()
+  const { screen, param } = parseHash()
+  renderScreen(screen || 'home', param)
 }
 
 boot()
